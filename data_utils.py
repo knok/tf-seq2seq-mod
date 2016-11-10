@@ -288,3 +288,17 @@ def prepare_wmt_data(data_dir, en_vocabulary_size, fr_vocabulary_size, tokenizer
   return (en_train_ids_path, fr_train_ids_path,
           en_dev_ids_path, fr_dev_ids_path,
           en_vocab_path, fr_vocab_path)
+def prepare_my_data(data_dir, en_vocabulary_size, fr_vocabulary_size, tokenizer=None):
+    input_path = os.path.join(data_dir, "input.txt")
+    output_path = os.path.join(data_dir, "output.txt")
+    fr_vocab_path = os.path.join(data_dir, "output.vocab%d.fr" % fr_vocabulary_size)
+    en_vocab_path = os.path.join(data_dir, "input.vocab%d.en" % en_vocabulary_size)
+    create_vocabulary(fr_vocab_path, output_path, fr_vocabulary_size, tokenizer)
+    create_vocabulary(en_vocab_path, input_path, en_vocabulary_size, tokenizer)
+    fr_train_ids_path = output_path + (".ids%d.fr" % fr_vocabulary_size)
+    en_train_ids_path = input_path + (".ids%d.en" % en_vocabulary_size)
+    data_to_token_ids(output_path, fr_train_ids_path, fr_vocab_path, tokenizer)
+    data_to_token_ids(input_path, en_train_ids_path, en_vocab_path, tokenizer)
+    return (en_train_ids_path, fr_train_ids_path,
+            None, None,
+            en_vocab_path, fr_vocab_path)
