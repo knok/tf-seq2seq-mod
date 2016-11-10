@@ -170,6 +170,13 @@ class Seq2SeqModel(object):
           self.target_weights, buckets,
           lambda x, y: seq2seq_f(x, y, False),
           softmax_loss_function=softmax_loss_function)
+      # If we use output projection, we need to project outputs for decoding.
+      if output_projection is not None:
+        for b in xrange(len(buckets)):
+          self.outputs[b] = [
+              tf.matmul(output, output_projection[0]) + output_projection[1]
+              for output in self.outputs[b]
+          ]
 
     # Gradients and SGD update operation for training the model.
     params = tf.trainable_variables()
@@ -236,6 +243,8 @@ class Seq2SeqModel(object):
       output_feed = [self.updates[bucket_id],  # Update Op that does SGD.
                      self.gradient_norms[bucket_id],  # Gradient norm.
                      self.losses[bucket_id]]  # Loss for this batch.
+      for l in xrange(decoder_size):  # Output logits.
+        output_feed.append(self.outputs[bucket_id][l])
     else:
       output_feed = [self.losses[bucket_id]]  # Loss for this batch.
       for l in xrange(decoder_size):  # Output logits.
@@ -243,7 +252,7 @@ class Seq2SeqModel(object):
 
     outputs = session.run(output_feed, input_feed)
     if not forward_only:
-      return outputs[1], outputs[2], None  # Gradient norm, loss, no outputs.
+      return outputs[1], outputs[2], outputs[3:]  # Gradient norm, loss, no outputs.
     else:
       return None, outputs[0], outputs[1:]  # No gradient norm, loss, outputs.
 
