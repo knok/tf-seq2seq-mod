@@ -41,8 +41,10 @@ import numpy as np
 from six.moves import xrange  # pylint: disable=redefined-builtin
 import tensorflow as tf
 
-from tensorflow.models.rnn.translate import data_utils
-from tensorflow.models.rnn.translate import seq2seq_model
+#from tensorflow.models.rnn.translate import data_utils
+import data_utils
+#from tensorflow.models.rnn.translate import seq2seq_model
+import seq2seq_model
 
 
 tf.app.flags.DEFINE_float("learning_rate", 0.5, "Learning rate.")
@@ -68,6 +70,8 @@ tf.app.flags.DEFINE_boolean("self_test", False,
                             "Run a self-test if this is set to True.")
 tf.app.flags.DEFINE_boolean("use_fp16", False,
                             "Train using fp16 instead of fp32.")
+tf.app.flags.DEFINE_boolean("use_lstm", False,
+                            "Model using LSTM instead of GRU.")
 
 FLAGS = tf.app.flags.FLAGS
 
@@ -75,6 +79,11 @@ FLAGS = tf.app.flags.FLAGS
 # See seq2seq_model.Seq2SeqModel for details of how they work.
 _buckets = [(5, 10), (10, 15), (20, 25), (40, 50)]
 
+config = tf.ConfigProto(
+  gpu_options=tf.GPUOptions(
+    allow_growth=True
+  )
+)
 
 def read_data(source_path, target_path, max_size=None):
   """Read data from source and target files and put into buckets.
@@ -127,6 +136,7 @@ def create_model(session, forward_only):
       FLAGS.batch_size,
       FLAGS.learning_rate,
       FLAGS.learning_rate_decay_factor,
+      use_lstm = FLAGS.use_lstm,
       forward_only=forward_only,
       dtype=dtype)
   ckpt = tf.train.get_checkpoint_state(FLAGS.train_dir)
@@ -140,11 +150,87 @@ def create_model(session, forward_only):
 
 
 def train():
+  en_train, fr_train, en_dev, fr_dev, en_vocab_path, fr_vocab_path = data_utils.prepare_my_data(
+      FLAGS.data_dir, FLAGS.en_vocab_size, FLAGS.fr_vocab_size)
+  _, rev_fr_vocab = data_utils.initialize_vocabulary(fr_vocab_path)
+  
+
+  with tf.Session(config=config) as sess:
+    # Create model.
+    print("Creating %d layers of %d units." % (FLAGS.num_layers, FLAGS.size))
+    model = create_model(sess, False)
+
+    # Read data into buckets and compute their sizes.
+    print ("Reading training data (limit: %d)."
+           % FLAGS.max_train_data_size)
+    train_set = read_data(en_train, fr_train, FLAGS.max_train_data_size)
+    train_bucket_sizes = [len(train_set[b]) for b in xrange(len(_buckets))]
+    train_total_size = float(sum(train_bucket_sizes))
+
+    # A bucket scale is a list of increasing numbers from 0 to 1 that we'll use
+    # to select a bucket. Length of [scale[i], scale[i+1]] is proportional to
+    # the size if i-th training bucket, as used later.
+    train_buckets_scale = [sum(train_bucket_sizes[:i + 1]) / train_total_size
+                           for i in xrange(len(train_bucket_sizes))]
+
+    # This is the training loop.
+    step_time, loss = 0.0, 0.0
+    current_step = 0
+    previous_losses = []
+    while True:
+      # Choose a bucket according to data distribution. We pick a random number
+      # in [0, 1] and use the corresponding interval in train_buckets_scale.
+      random_number_01 = np.random.random_sample()
+      bucket_id = min([i for i in xrange(len(train_buckets_scale))
+                       if train_buckets_scale[i] > random_number_01])
+
+      # Get a batch and make a step.
+      start_time = time.time()
+      encoder_inputs, decoder_inputs, target_weights = model.get_batch(
+          train_set, bucket_id)
+      _, step_loss, output_logits = model.step(sess, encoder_inputs, decoder_inputs,
+                                   target_weights, bucket_id, False)
+      step_time += (time.time() - start_time) / FLAGS.steps_per_checkpoint
+      loss += step_loss / FLAGS.steps_per_checkpoint
+      current_step += 1
+
+      # Once in a while, we save checkpoint, print statistics, and run evals.
+      if current_step % FLAGS.steps_per_checkpoint == 0:
+        # Print statistics for the previous epoch.
+        perplexity = math.exp(float(loss)) if loss < 300 else float("inf")
+        print ("global step %d learning rate %.4f step-time %.2f perplexity "
+               "%.2f" % (model.global_step.eval(), model.learning_rate.eval(),
+                         step_time, perplexity))
+        # Decrease learning rate if no improvement was seen over last 3 times.
+        if len(previous_losses) > 2 and loss > max(previous_losses[-3:]):
+          sess.run(model.learning_rate_decay_op)
+        previous_losses.append(loss)
+        # Save checkpoint and zero timer and loss.
+        checkpoint_path = os.path.join(FLAGS.train_dir, "translate.ckpt")
+        model.saver.save(sess, checkpoint_path, global_step=model.global_step)
+        step_time, loss = 0.0, 0.0
+        # output train/hyp
+        out_batch_size = output_logits[0].shape[0]
+        rand_idx = np.random.randint(0, out_batch_size)
+        inputs = [int(x[rand_idx]) for x in decoder_inputs]
+        outputs = [int(np.argmax(logit[rand_idx])) for logit in output_logits]
+        if data_utils.EOS_ID in inputs:
+          inputs = inputs[:inputs.index(data_utils.EOS_ID)]
+        if data_utils.EOS_ID in outputs:
+          outputs = outputs[:outputs.index(data_utils.EOS_ID)]
+        print("  trg = " + " ".join([tf.compat.as_str(rev_fr_vocab[input]) for input in inputs[1:]]))
+        print("  hyp = " + " ".join([tf.compat.as_str(rev_fr_vocab[output]) for output in outputs]))
+        
+        sys.stdout.flush()
+
+def orig_train():
   """Train a en->fr translation model using WMT data."""
   # Prepare WMT data.
   print("Preparing WMT data in %s" % FLAGS.data_dir)
-  en_train, fr_train, en_dev, fr_dev, _, _ = data_utils.prepare_wmt_data(
+  en_train, fr_train, en_dev, fr_dev, en_vocab_path, fr_vocab_path = data_utils.prepare_wmt_data(
       FLAGS.data_dir, FLAGS.en_vocab_size, FLAGS.fr_vocab_size)
+  _, rev_fr_vocab = data_utils.initialize_vocabulary(fr_vocab_path)
+  
 
   with tf.Session() as sess:
     # Create model.
@@ -152,7 +238,7 @@ def train():
     model = create_model(sess, False)
 
     # Read data into buckets and compute their sizes.
-    print ("Reading development and training data (limit: %d)."
+    print ("Reading development  training data (limit: %d)."
            % FLAGS.max_train_data_size)
     dev_set = read_data(en_dev, fr_dev)
     train_set = read_data(en_train, fr_train, FLAGS.max_train_data_size)
@@ -180,7 +266,7 @@ def train():
       start_time = time.time()
       encoder_inputs, decoder_inputs, target_weights = model.get_batch(
           train_set, bucket_id)
-      _, step_loss, _ = model.step(sess, encoder_inputs, decoder_inputs,
+      _, step_loss, output_logits = model.step(sess, encoder_inputs, decoder_inputs,
                                    target_weights, bucket_id, False)
       step_time += (time.time() - start_time) / FLAGS.steps_per_checkpoint
       loss += step_loss / FLAGS.steps_per_checkpoint
@@ -201,6 +287,18 @@ def train():
         checkpoint_path = os.path.join(FLAGS.train_dir, "translate.ckpt")
         model.saver.save(sess, checkpoint_path, global_step=model.global_step)
         step_time, loss = 0.0, 0.0
+        # output train/hyp
+        out_batch_size = output_logits[0].shape[0]
+        rand_idx = np.random.randint(0, out_batch_size)
+        inputs = [int(x[rand_idx]) for x in decoder_inputs]
+        outputs = [int(np.argmax(logit[rand_idx])) for logit in output_logits]
+        if data_utils.EOS_ID in inputs:
+          inputs = inputs[:inputs.index(data_utils.EOS_ID)]
+        if data_utils.EOS_ID in outputs:
+          outputs = outputs[:outputs.index(data_utils.EOS_ID)]
+        print("  trg = " + " ".join([tf.compat.as_str(rev_fr_vocab[input]) for input in inputs]))
+        print("  hyp = " + " ".join([tf.compat.as_str(rev_fr_vocab[output]) for output in outputs]))
+        
         # Run evals on development set and print their perplexity.
         for bucket_id in xrange(len(_buckets)):
           if len(dev_set[bucket_id]) == 0:
@@ -223,10 +321,8 @@ def decode():
     model.batch_size = 1  # We decode one sentence at a time.
 
     # Load vocabularies.
-    en_vocab_path = os.path.join(FLAGS.data_dir,
-                                 "vocab%d.en" % FLAGS.en_vocab_size)
-    fr_vocab_path = os.path.join(FLAGS.data_dir,
-                                 "vocab%d.fr" % FLAGS.fr_vocab_size)
+    _, _, _, _, en_vocab_path, fr_vocab_path = data_utils.prepare_my_data(
+      FLAGS.data_dir, FLAGS.en_vocab_size, FLAGS.fr_vocab_size)
     en_vocab, _ = data_utils.initialize_vocabulary(en_vocab_path)
     _, rev_fr_vocab = data_utils.initialize_vocabulary(fr_vocab_path)
 
@@ -284,6 +380,7 @@ def main(_):
   elif FLAGS.decode:
     decode()
   else:
+    #orig_train()
     train()
 
 if __name__ == "__main__":
